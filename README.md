@@ -27,7 +27,7 @@ The Xcode MCP Server provides a Model Context Protocol interface for building an
 
 ```bash
 # Clone the repository
-git clone [your-repo-url]
+git clone https://github.com/PolarVista/Xcode-mcp-server.git
 cd xcode-mcp-server
 
 # Install dependencies
