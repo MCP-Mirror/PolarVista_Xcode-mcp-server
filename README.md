@@ -45,11 +45,14 @@ npm run build
    ```
 
 2. In Claude Desktop settings:
-   - Go to "Context Sources"
-   - Click "Add New Source"
-   - Select "Custom MCP Server"
-   - Choose "Standard Input/Output"
-   - Enter the path to the server: `node /path/to/xcode-mcp-server/build/index.js /path/to/build/logs/directory`
+   ```        "xcode-build": {
+          "command": "node",
+          "args": ["/path/to/the/xcode-mcp-server/build/index.js",
+                   "/path/to/your/project/folder"],
+          "env": {
+            "PATH": "/usr/bin:/bin:/usr/local/bin:/usr/sbin:/sbin"
+      }
+   ```
 
 ## Available Tools
 
