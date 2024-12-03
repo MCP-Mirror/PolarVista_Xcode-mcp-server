@@ -18,6 +18,17 @@ function isBuildArguments(args) {
         (a.configuration === undefined || typeof a.configuration === 'string') &&
         (a.destination === undefined || typeof a.destination === 'string'));
 }
+function isTestArguments(args) {
+    if (typeof args !== 'object' || args === null)
+        return false;
+    const a = args;
+    return (typeof a.projectPath === 'string' &&
+        typeof a.scheme === 'string' &&
+        (a.testIdentifier === undefined || typeof a.testIdentifier === 'string') &&
+        (a.skipTests === undefined || (Array.isArray(a.skipTests) && a.skipTests.every(t => typeof t === 'string'))) &&
+        (a.configuration === undefined || typeof a.configuration === 'string') &&
+        (a.destination === undefined || typeof a.destination === 'string'));
+}
 class XcodeBuildServer {
     constructor(baseDir) {
         this.latestBuildLog = null;
@@ -49,6 +60,81 @@ class XcodeBuildServer {
     setupHandlers() {
         this.setupResourceHandlers();
         this.setupToolHandlers();
+    }
+    async runTests(projectPath, scheme, configuration = "Debug", testIdentifier, skipTests, destination = "platform=iOS Simulator,name=iPhone 15 Pro") {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const logPath = path.join(this.buildLogsDir, `test-${timestamp}.log`);
+        const projectDir = path.dirname(projectPath);
+        const reportsPath = path.join(projectDir, 'TestReports', `Reports-${timestamp}`);
+        const xcresultPath = `${reportsPath}.xcresult`;
+        try {
+            await mkdir(path.join(projectDir, 'TestReports'), { recursive: true });
+        }
+        catch (error) {
+            console.error(`Failed to prepare test reports directory: ${error}`);
+        }
+        let testFlags = 'test';
+        if (testIdentifier) {
+            testFlags += ` -only-testing:${testIdentifier}`;
+        }
+        if (skipTests?.length) {
+            testFlags += ` ${skipTests.map(test => `-skip-testing:${test}`).join(' ')}`;
+        }
+        const command = `which xcodebuild && xcodebuild -project "${projectPath}" \
+        -scheme "${scheme}" \
+        -configuration "${configuration}" \
+        -destination '${destination}' \
+        -resultBundlePath "${xcresultPath}" \
+        -enableCodeCoverage YES \
+        -UseModernBuildSystem=YES \
+        -json \
+        clean ${testFlags} 2>&1 | tee ${logPath}`;
+        try {
+            const { stdout, stderr } = await execAsync(command, { maxBuffer: 100 * 1024 * 1024 });
+            try {
+                const jsonOutput = stdout.split('\n')
+                    .filter(line => line.trim())
+                    .map(line => {
+                    try {
+                        return JSON.parse(line);
+                    }
+                    catch (e) {
+                        return line;
+                    }
+                });
+                await writeFile(logPath + '.json', JSON.stringify(jsonOutput, null, 2));
+            }
+            catch (parseError) {
+                console.error('Failed to parse JSON output:', parseError);
+            }
+            // Process test results using xcresulttool
+            if (fs.existsSync(xcresultPath)) {
+                try {
+                    // Get test summary
+                    const summaryCmd = `xcrun xcresulttool get --format json --path "${xcresultPath}"`;
+                    const { stdout: summaryOutput } = await execAsync(summaryCmd);
+                    await writeFile(path.join(this.buildLogsDir, `test-summary-${timestamp}.json`), summaryOutput);
+                    // Get code coverage if available
+                    const coverageOutput = await execAsync(`xcrun xccov view --report "${xcresultPath}"`);
+                    await writeFile(path.join(this.buildLogsDir, `coverage-${timestamp}.txt`), coverageOutput.stdout);
+                }
+                catch (resultsError) {
+                    console.error('Failed to process test results:', resultsError);
+                }
+            }
+            const success = !stdout.includes('** TEST FAILED **') && !stdout.includes('** BUILD FAILED **');
+            return { success, output: stdout + stderr, logPath };
+        }
+        catch (error) {
+            console.error('Test error:', error);
+            if (error instanceof Error) {
+                const execError = error;
+                const errorOutput = error.message + (execError.stderr ? `\n${execError.stderr}` : '');
+                await writeFile(logPath, errorOutput);
+                return { success: false, output: errorOutput, logPath };
+            }
+            throw error;
+        }
     }
     setupResourceHandlers() {
         this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
@@ -102,40 +188,73 @@ class XcodeBuildServer {
                         },
                         required: ["projectPath", "scheme"]
                     }
+                },
+                {
+                    name: "run_tests",
+                    description: "Run Xcode project tests with optional filtering",
+                    inputSchema: {
+                        type: "object",
+                        properties: {
+                            projectPath: {
+                                type: "string",
+                                description: "Path to the .xcodeproj or .xcworkspace"
+                            },
+                            scheme: {
+                                type: "string",
+                                description: "Test scheme name"
+                            },
+                            testIdentifier: {
+                                type: "string",
+                                description: "Optional specific test to run (e.g., 'MyTests/testExample')"
+                            },
+                            skipTests: {
+                                type: "array",
+                                items: { type: "string" },
+                                description: "Optional array of test identifiers to skip"
+                            },
+                            configuration: {
+                                type: "string",
+                                description: "Build configuration (e.g., Debug, Release)",
+                                default: "Debug"
+                            }
+                        },
+                        required: ["projectPath", "scheme"]
+                    }
                 }]
         }));
         this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-            if (request.params.name !== "build_project") {
-                throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
-            }
-            if (!isBuildArguments(request.params.arguments)) {
-                throw new McpError(ErrorCode.InvalidParams, "Invalid build arguments provided");
-            }
-            const { projectPath, scheme, configuration = "Debug", destination } = request.params.arguments;
-            try {
-                const result = await this.buildProject(projectPath, scheme, configuration, destination);
-                this.latestBuildLog = result.logPath;
-                return {
-                    content: [{
-                            type: "text",
-                            text: result.output
-                        }],
-                    isError: !result.success
-                };
-            }
-            catch (error) {
-                console.error('Build error:', error);
-                const errorMessage = error instanceof Error ? error.message : String(error);
-                const errorOutput = error instanceof Error && 'stderr' in error
-                    ? `${errorMessage}\n${error.stderr}`
-                    : errorMessage;
-                return {
-                    content: [{
-                            type: "text",
-                            text: `Build failed: ${errorOutput}`
-                        }],
-                    isError: true
-                };
+            switch (request.params.name) {
+                case "build_project": {
+                    if (!isBuildArguments(request.params.arguments)) {
+                        throw new McpError(ErrorCode.InvalidParams, "Invalid build arguments provided");
+                    }
+                    const { projectPath, scheme, configuration = "Debug", destination } = request.params.arguments;
+                    const result = await this.buildProject(projectPath, scheme, configuration, destination);
+                    this.latestBuildLog = result.logPath;
+                    return {
+                        content: [{
+                                type: "text",
+                                text: result.output
+                            }],
+                        isError: !result.success
+                    };
+                }
+                case "run_tests": {
+                    if (!isTestArguments(request.params.arguments)) {
+                        throw new McpError(ErrorCode.InvalidParams, "Invalid test arguments provided");
+                    }
+                    const result = await this.runTests(request.params.arguments.projectPath, request.params.arguments.scheme, request.params.arguments.configuration, request.params.arguments.testIdentifier, request.params.arguments.skipTests, request.params.arguments.destination);
+                    this.latestBuildLog = result.logPath;
+                    return {
+                        content: [{
+                                type: "text",
+                                text: result.output
+                            }],
+                        isError: !result.success
+                    };
+                }
+                default:
+                    throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
             }
         });
     }
