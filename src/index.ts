@@ -38,6 +38,27 @@ interface TestArguments {
     destination?: string;
 }
 
+interface BuildOptions extends BuildArguments {
+    includeWarnings?: boolean;
+}
+
+interface TestOptions extends TestArguments {
+    includeWarnings?: boolean;
+}
+
+// Add these type guard functions
+function isBuildOptions(args: unknown): args is BuildOptions {
+    if (!isBuildArguments(args)) return false;
+    const a = args as Partial<BuildOptions>;
+    return a.includeWarnings === undefined || typeof a.includeWarnings === 'boolean';
+}
+
+function isTestOptions(args: unknown): args is TestOptions {
+    if (!isTestArguments(args)) return false;
+    const a = args as Partial<TestOptions>;
+    return a.includeWarnings === undefined || typeof a.includeWarnings === 'boolean';
+}
+
 function isTestArguments(args: unknown): args is TestArguments {
     if (typeof args !== 'object' || args === null) return false;
     const a = args as Partial<TestArguments>;
@@ -97,6 +118,35 @@ class XcodeBuildServer {
         this.setupResourceHandlers();
         this.setupToolHandlers();
     }
+
+    // Add this helper function in the XcodeBuildServer class
+private filterBuildOutput(jsonOutput: any[]): any[] {
+    const significantErrors = jsonOutput.filter(line => {
+        if (typeof line === 'string') {
+            // Include build system lines
+            if (line.startsWith('/usr/bin/xcodebuild') || 
+                line.includes('** BUILD')) {
+                return true;
+            }
+
+            // Include only actual error messages and their notes
+            if (line.match(/^\/.+:\d+:\d+: error:/) ||  // Matches error lines with file paths
+                line.includes('note: found this candidate')) {
+                return true;
+            }
+
+            return false;
+        }
+        
+        if (typeof line === 'object' && line?.type === 'diagnostic') {
+            return line.diagnostic?.severity === 'error';
+        }
+        
+        return false;
+    });
+
+    return significantErrors;
+}
 
 private async runTests(
     projectPath: string,
@@ -231,6 +281,11 @@ private setupToolHandlers(): void {
                         type: "string",
                         description: "Build configuration (e.g., Debug, Release)",
                         default: "Debug"
+                    },
+                    includeWarnings: {
+                        type: "boolean",
+                        description: "Include warning messages in output",
+                        default: false
                     }
                 },
                 required: ["projectPath", "scheme"]
@@ -273,11 +328,11 @@ private setupToolHandlers(): void {
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
         switch (request.params.name) {
             case "build_project": {
-                if (!isBuildArguments(request.params.arguments)) {
+                if (!isBuildOptions(request.params.arguments)) {
                     throw new McpError(ErrorCode.InvalidParams, "Invalid build arguments provided");
                 }
-                const { projectPath, scheme, configuration = "Debug", destination } = request.params.arguments;
-                const result = await this.buildProject(projectPath, scheme, configuration, destination);
+                const { projectPath, scheme, configuration = "Debug", destination, includeWarnings = false } = request.params.arguments;
+                const result = await this.buildProject(projectPath, scheme, configuration, destination, includeWarnings);
                 this.latestBuildLog = result.logPath;
                 return {
                     content: [{
@@ -316,7 +371,13 @@ private setupToolHandlers(): void {
     });
 }
 
-private async buildProject(projectPath: string, scheme: string, configuration: string, destination: string = "platform=iOS Simulator,name=iPhone 15 Pro") {
+private async buildProject(
+    projectPath: string, 
+    scheme: string, 
+    configuration: string, 
+    destination: string = "platform=iOS Simulator,name=iPhone 15 Pro",
+    includeWarnings: boolean = false
+) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const logPath = path.join(this.buildLogsDir, `build-${timestamp}.log`);
     const projectDir = path.dirname(projectPath);
@@ -333,7 +394,7 @@ private async buildProject(projectPath: string, scheme: string, configuration: s
         -scheme "${scheme}" \
         -configuration "${configuration}" \
         -destination '${destination}' \
-        -resultBundlePath "${reportsPath}" \
+        -resultBundlePath "${xcresultPath}" \
         -UseModernBuildSystem=YES \
         -json \
         clean build 2>&1 | tee ${logPath}`;
@@ -342,7 +403,6 @@ private async buildProject(projectPath: string, scheme: string, configuration: s
         const { stdout, stderr } = await execAsync(command, { maxBuffer: 100 * 1024 * 1024 });
         
         try {
-            // Parse JSON output if possible
             const jsonOutput = stdout.split('\n')
                 .filter(line => line.trim())
                 .map(line => {
@@ -352,29 +412,38 @@ private async buildProject(projectPath: string, scheme: string, configuration: s
                         return line;
                     }
                 });
-            await writeFile(logPath + '.json', JSON.stringify(jsonOutput, null, 2));
+
+            // Filter warnings if needed
+            const filteredOutput = includeWarnings ? jsonOutput : this.filterBuildOutput(jsonOutput);
+            
+            await writeFile(logPath + '.json', JSON.stringify(filteredOutput, null, 2));
+            
+            // Use filtered output for response
+            const outputText = filteredOutput
+                .map(line => typeof line === 'string' ? line : JSON.stringify(line))
+                .join('\n');
+
+            // Process xcresult if it exists
+            if (fs.existsSync(xcresultPath)) {
+                try {
+                    const reportOutput = await execAsync(`xcrun xcresulttool get --format json --path "${xcresultPath}"`);
+                    await writeFile(path.join(this.buildLogsDir, `report-${timestamp}.json`), reportOutput.stdout);
+                    
+                    const summaryOutput = await execAsync(`xcrun xcresulttool get --format human-readable --path "${xcresultPath}"`);
+                    await writeFile(path.join(this.buildLogsDir, `report-${timestamp}.txt`), summaryOutput.stdout);
+                } catch (reportError) {
+                    console.error('Failed to process build results:', reportError);
+                }
+            }
+
+            const success = !stdout.includes('** BUILD FAILED **');
+            return { success, output: outputText, logPath };
+            
         } catch (parseError) {
             console.error('Failed to parse JSON output:', parseError);
+            return { success: false, output: stdout + stderr, logPath };
         }
 
-        // Read and format the report if it exists
-if (fs.existsSync(xcresultPath)) {
-    try {
-        // Get the full result bundle in JSON format
-        const reportOutput = await execAsync(`xcrun xcresulttool get --format json --path "${xcresultPath}"`);
-        await writeFile(path.join(this.buildLogsDir, `report-${timestamp}.json`), reportOutput.stdout);
-        
-        // Optionally also get a human-readable summary
-        const summaryOutput = await execAsync(`xcrun xcresulttool get --format human-readable --path "${xcresultPath}"`);
-        await writeFile(path.join(this.buildLogsDir, `report-${timestamp}.txt`), summaryOutput.stdout);
-    } catch (reportError) {
-        console.error('Failed to process build results:', reportError);
-        // Don't fail the build just because we couldn't process the report
-    }
-}
-
-        const success = !stdout.includes('** BUILD FAILED **');
-        return { success, output: stdout + stderr, logPath };
     } catch (error) {
         console.error('Build error:', error);
         if (error instanceof Error) {
