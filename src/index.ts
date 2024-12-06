@@ -358,10 +358,20 @@ private async buildProject(projectPath: string, scheme: string, configuration: s
         }
 
         // Read and format the report if it exists
-        if (fs.existsSync(xcresultPath)) {
-            const reportOutput = await execAsync(`xcodebuild -formatResultBundle ${xcresultPath} -resultBundlePath ${reportsPath}_formatted.xcresult`);
-            await writeFile(path.join(this.buildLogsDir, `report-${timestamp}.txt`), reportOutput.stdout);
-        }
+if (fs.existsSync(xcresultPath)) {
+    try {
+        // Get the full result bundle in JSON format
+        const reportOutput = await execAsync(`xcrun xcresulttool get --format json --path "${xcresultPath}"`);
+        await writeFile(path.join(this.buildLogsDir, `report-${timestamp}.json`), reportOutput.stdout);
+        
+        // Optionally also get a human-readable summary
+        const summaryOutput = await execAsync(`xcrun xcresulttool get --format human-readable --path "${xcresultPath}"`);
+        await writeFile(path.join(this.buildLogsDir, `report-${timestamp}.txt`), summaryOutput.stdout);
+    } catch (reportError) {
+        console.error('Failed to process build results:', reportError);
+        // Don't fail the build just because we couldn't process the report
+    }
+}
 
         const success = !stdout.includes('** BUILD FAILED **');
         return { success, output: stdout + stderr, logPath };
